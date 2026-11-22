@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pillow
+pytesseract
+imagehash
+numpy
+httpx
+beautifulsoup4
