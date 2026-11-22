@@ -12,18 +12,20 @@ IMPORTANT: An image alone can NEVER prove a payment is real. Only step 4
 (asking the provider) is proof. Steps 1-3 only catch lazy fakes and reuse.
 
 Run:
-    pip install -r requirements.txt
+    pip install -r requirements.txt      (also install the tesseract-ocr program)
     uvicorn main:app --host 0.0.0.0 --port 8000
 Docs:  http://localhost:8000/docs
 UI:    http://localhost:8000/ui
 """
 import hashlib
+import hmac
 import io
 import os
 import re
 import sqlite3
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
 import imagehash
@@ -31,9 +33,10 @@ import numpy as np
 import pytesseract
 from bs4 import BeautifulSoup
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from PIL import ExifTags, Image, ImageChops
+from PIL import ExifTags, Image, ImageChops, ImageOps
 
 # ----------------------------------------------------------------------------
 # Config
@@ -43,6 +46,7 @@ DB_PATH = os.getenv("DB_PATH", "/tmp/receipts.db")
 VERIFY_SSL = os.getenv("VERIFY_SSL", "true").lower() == "true"
 OCR_LANG = os.getenv("OCR_LANG", "eng")  # use "eng+amh" if amh traineddata installed
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
+Image.MAX_IMAGE_PIXELS = 40_000_000  # protect against decompression bombs
 
 PROVIDERS = {
     "telebirr": {
@@ -67,7 +71,9 @@ EDITOR_TAGS = [
     "paint.net", "affinity", "photopea", "fotor", "inpaint", "meitu", "facetune",
 ]
 
-app = FastAPI(title="Payment Screenshot Checker", version="1.0")
+TXN_RE = re.compile(r"^[A-Z0-9]{6,30}$")
+
+app = FastAPI(title="Payment Screenshot Checker", version="1.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -81,11 +87,14 @@ app.add_middleware(
 # Auth + DB
 # ----------------------------------------------------------------------------
 def auth(x_api_key: str = Header(default="")):
-    if API_KEY and x_api_key != API_KEY:
+    if API_KEY and not hmac.compare_digest(x_api_key.encode(), API_KEY.encode()):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
 def db():
+    folder = os.path.dirname(DB_PATH)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
     conn.execute(
         """CREATE TABLE IF NOT EXISTS receipts (
@@ -105,6 +114,7 @@ def run_ocr(img: Image.Image) -> str:
     try:
         return pytesseract.image_to_string(img, lang=OCR_LANG)
     except pytesseract.TesseractError:
+        # language pack missing -> fall back to English
         return pytesseract.image_to_string(img, lang="eng")
 
 
@@ -112,38 +122,43 @@ def detect_provider(text: str) -> Optional[str]:
     low = text.lower()
     for name, cfg in PROVIDERS.items():
         for kw in sorted(cfg["keywords"], key=len, reverse=True):
-            if kw in low:
+            # word boundaries so "cbe" does not match inside other words
+            if re.search(r"(?<![a-z0-9])" + re.escape(kw) + r"(?![a-z0-9])", low):
                 return name
     return None
 
 
+TXN_LABEL_RE = re.compile(
+    r"(?:transaction\s*(?:no|number|id)|receipt\s*no|ref(?:erence)?\s*(?:no|number)?)"
+    r"\s*\.?\s*[:\-]?\s*([A-Z0-9]{8,20})\b",
+    re.I,
+)
+
+
 def extract_txn(text: str) -> Optional[str]:
-    m = re.search(
-        r"(?:transaction\s*(?:no|number|id)\.?|receipt\s*no\.?|ref(?:erence)?\s*(?:no|number)?\.?)"
-        r"\s*[:\-]?\s*([A-Z0-9]{8,20})",
-        text,
-        re.I,
-    )
-    if m:
-        return m.group(1).upper()
+    for m in TXN_LABEL_RE.finditer(text):
+        tok = m.group(1).upper()
+        if re.search(r"\d", tok):  # a real ID has digits (skips plain words)
+            return tok
     for tok in re.findall(r"\b[A-Z0-9]{10}\b", text.upper()):
         if re.search(r"\d", tok) and re.search(r"[A-Z]", tok):
             return tok
     return None
 
 
+AMOUNT_PATTERNS = [
+    r"(?:total\s*paid\s*amount|amount|total)\s*[:\-]?\s*(?:ETB|Birr)?\s*(\d[\d,]*(?:\.\d{1,2})?)",
+    r"(\d[\d,]*(?:\.\d{1,2})?)\s*(?:ETB|Birr)",
+]
+
+
 def extract_amount(text: str) -> Optional[float]:
-    patterns = [
-        r"(?:total\s*paid\s*amount|amount|total)\s*[:\-]?\s*(?:ETB|Birr)?\s*([\d,]+(?:\.\d{1,2})?)",
-        r"([\d,]+(?:\.\d{1,2})?)\s*(?:ETB|Birr)",
-    ]
-    for p in patterns:
-        m = re.search(p, text, re.I)
-        if m:
+    for p in AMOUNT_PATTERNS:
+        for m in re.finditer(p, text, re.I):
             try:
                 return float(m.group(1).replace(",", ""))
             except ValueError:
-                pass
+                continue
     return None
 
 
@@ -181,12 +196,12 @@ def exif_flags(img: Image.Image) -> list[str]:
     return flags
 
 
-def ela_ratio(img: Image.Image, quality: int = 90) -> float:
-    rgb = img.convert("RGB")
+def ela_ratio(rgb: Image.Image, quality: int = 90) -> float:
     buf = io.BytesIO()
     rgb.save(buf, "JPEG", quality=quality)
     buf.seek(0)
-    diff = ImageChops.difference(rgb, Image.open(buf))
+    resaved = Image.open(buf).convert("RGB")
+    diff = ImageChops.difference(rgb, resaved)
     arr = np.asarray(diff).astype(float).sum(axis=2)
     h, w = arr.shape
     b = 32
@@ -210,7 +225,11 @@ async def confirm_with_provider(
     if not cfg or not cfg["receipt_url"]:
         return {"checked": False, "reason": f"No receipt lookup configured for '{provider}'"}
 
-    url = cfg["receipt_url"].format(txn=txn)
+    # never put raw user input into a URL path
+    if not TXN_RE.match(txn):
+        return {"checked": True, "found": False, "reason": "Transaction ID has an invalid format"}
+
+    url = cfg["receipt_url"].replace("{txn}", quote(txn, safe=""))
     try:
         async with httpx.AsyncClient(timeout=15, verify=VERIFY_SSL, follow_redirects=True) as c:
             r = await c.get(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -223,17 +242,17 @@ async def confirm_with_provider(
         return {"checked": False, "reason": f"Provider returned HTTP {r.status_code}"}
 
     text = BeautifulSoup(r.text, "html.parser").get_text(" ", strip=True)
-    flat = text.replace(",", "")
-    found = txn.lower() in text.lower()
-    if not found:
+    low = text.lower()
+    if txn.lower() not in low:
         return {"checked": True, "found": False, "reason": "Receipt page does not contain this transaction ID"}
 
     result = {"checked": True, "found": True, "amount_match": None, "receiver_match": None}
     if amount is not None:
-        result["amount_match"] = (f"{amount:.2f}" in flat) or (f"{amount:.0f}" in re.findall(r"\d+", flat))
+        numbers = [float(n) for n in re.findall(r"\d+(?:\.\d+)?", text.replace(",", ""))]
+        result["amount_match"] = any(abs(n - amount) < 0.01 for n in numbers)
     if receiver:
         words = [w for w in re.split(r"\s+", receiver.lower()) if len(w) > 2]
-        result["receiver_match"] = bool(words) and all(w in text.lower() for w in words)
+        result["receiver_match"] = bool(words) and all(w in low for w in words)
     return result
 
 
@@ -252,6 +271,15 @@ def decide(score: int, provider_result: dict, hard_fake: bool) -> str:
     return "UNVERIFIED" if score >= 60 else "SUSPICIOUS"
 
 
+def prepare_image(img: Image.Image) -> Image.Image:
+    """Fix phone rotation and convert any mode (RGBA, P, L...) to RGB."""
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
+    return img.convert("RGB")
+
+
 async def analyze(
     img: Image.Image,
     raw: bytes,
@@ -261,7 +289,15 @@ async def analyze(
 ) -> dict:
     score, reasons, hard_fake = 100, [], False
 
-    text = run_ocr(img)
+    fmt = (img.format or "").upper()  # read before converting (format is lost after)
+    flags = exif_flags(img)
+    rgb = prepare_image(img)
+
+    try:
+        text = await run_in_threadpool(run_ocr, rgb)
+    except pytesseract.TesseractNotFoundError:
+        raise HTTPException(503, "Tesseract OCR is not installed on the server")
+
     provider = detect_provider(text)
     txn = extract_txn(text)
     amount = extract_amount(text)
@@ -286,57 +322,74 @@ async def analyze(
             score -= 25
             reasons.append("Receiver name on image does not match expected receiver")
 
-    for f in exif_flags(img):
+    for f in flags:
         score -= 35
         reasons.append(f)
-    fmt = (img.format or "").upper()
     if fmt in ("JPEG", "JPG"):
-        ratio = ela_ratio(img)
+        ratio = await run_in_threadpool(ela_ratio, rgb)
         if ratio > 8:
             score -= 15
             reasons.append(f"Uneven compression (ELA ratio {ratio:.1f}) - possible edited region")
 
     sha = hashlib.sha256(raw).hexdigest()
-    ph = str(imagehash.phash(img))
-    conn = db()
-    dup_img = conn.execute("SELECT 1 FROM receipts WHERE sha256=?", (sha,)).fetchone()
-    dup_txn = conn.execute("SELECT 1 FROM receipts WHERE txn=? AND status IN ('REAL','UNVERIFIED')", (txn,)).fetchone() if txn else None
-    near_dup = False
-    for (old,) in conn.execute("SELECT phash FROM receipts WHERE phash IS NOT NULL ORDER BY id DESC LIMIT 5000"):
-        try:
-            if imagehash.hex_to_hash(old) - imagehash.phash(img) <= 4 and old != ph:
-                near_dup = True
-                break
-        except Exception:
-            continue
-    if dup_img or dup_txn:
-        hard_fake = True
-        reasons.append("This receipt/transaction ID was already submitted before (reuse)")
-    elif near_dup:
-        score -= 25
-        reasons.append("Image is very similar to a previous receipt but not identical (possible edited copy)")
+    ph_obj = imagehash.phash(rgb)
+    ph = str(ph_obj)
 
     provider_result = {"checked": False, "reason": "No transaction ID"}
-    if txn:
-        provider_result = await confirm_with_provider(provider, txn, amount, receiver)
-        if provider_result.get("checked") and provider_result.get("found") is False:
-            reasons.append(provider_result["reason"])
-        elif provider_result.get("found"):
-            if provider_result.get("amount_match") is False:
-                reasons.append("Amount on image does not match the provider's record")
-            if provider_result.get("receiver_match") is False:
-                reasons.append("Receiver on image does not match the provider's record")
-        else:
-            reasons.append(f"Not confirmed with provider: {provider_result.get('reason')}")
-    verdict = decide(max(score, 0), provider_result, hard_fake)
-
-    if register:
-        conn.execute(
-            "INSERT INTO receipts (txn, sha256, phash, provider, amount, status, created_at) VALUES (?,?,?,?,?,?,?)",
-            (txn, sha, ph, provider, amount, verdict, datetime.now(timezone.utc).isoformat()),
+    conn = db()
+    try:
+        dup_img = conn.execute("SELECT 1 FROM receipts WHERE sha256=?", (sha,)).fetchone()
+        dup_txn = (
+            conn.execute(
+                "SELECT 1 FROM receipts WHERE txn=? AND status IN ('REAL','UNVERIFIED')", (txn,)
+            ).fetchone()
+            if txn
+            else None
         )
-        conn.commit()
-    conn.close()
+
+        near_dup = False
+        if not (dup_img or dup_txn):
+            rows = conn.execute(
+                "SELECT phash FROM receipts WHERE phash IS NOT NULL ORDER BY id DESC LIMIT 5000"
+            ).fetchall()
+            for (old,) in rows:
+                try:
+                    # distance 0 also counts: same picture re-saved/re-compressed
+                    if ph_obj - imagehash.hex_to_hash(old) <= 4:
+                        near_dup = True
+                        break
+                except Exception:
+                    continue
+
+        if dup_img or dup_txn:
+            hard_fake = True
+            reasons.append("This receipt/transaction ID was already submitted before (reuse)")
+        elif near_dup:
+            score -= 25
+            reasons.append("Image is very similar to a previous receipt (possible edited or re-saved copy)")
+
+        if txn:
+            provider_result = await confirm_with_provider(provider, txn, amount, receiver)
+            if provider_result.get("checked") and provider_result.get("found") is False:
+                reasons.append(provider_result["reason"])
+            elif provider_result.get("found"):
+                if provider_result.get("amount_match") is False:
+                    reasons.append("Amount on image does not match the provider's record")
+                if provider_result.get("receiver_match") is False:
+                    reasons.append("Receiver on image does not match the provider's record")
+            else:
+                reasons.append(f"Not confirmed with provider: {provider_result.get('reason')}")
+
+        verdict = decide(max(score, 0), provider_result, hard_fake)
+
+        if register:
+            conn.execute(
+                "INSERT INTO receipts (txn, sha256, phash, provider, amount, status, created_at) VALUES (?,?,?,?,?,?,?)",
+                (txn, sha, ph, provider, amount, verdict, datetime.now(timezone.utc).isoformat()),
+            )
+            conn.commit()
+    finally:
+        conn.close()
 
     return {
         "verdict": verdict,
@@ -667,7 +720,7 @@ async def verify_image(
     expected_receiver: Optional[str] = Form(None),
     register: bool = Form(True),
 ):
-    raw = await file.read()
+    raw = await file.read(MAX_IMAGE_BYTES + 1)  # never load more than the limit
     if len(raw) > MAX_IMAGE_BYTES:
         raise HTTPException(413, "Image too large (max 8 MB)")
     try:
@@ -686,7 +739,9 @@ async def verify_transaction(
     expected_receiver: Optional[str] = Form(None),
 ):
     """Check a transaction ID directly (no image). Most reliable method."""
-    res = await confirm_with_provider(provider.lower(), transaction_id.strip().upper(), expected_amount, expected_receiver)
+    res = await confirm_with_provider(
+        provider.strip().lower(), transaction_id.strip().upper(), expected_amount, expected_receiver
+    )
     if res.get("checked") and res.get("found"):
         ok = res.get("amount_match") is not False and res.get("receiver_match") is not False
         verdict = "REAL" if ok else "FAKE"
