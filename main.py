@@ -27,16 +27,45 @@ from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import quote
 
-import httpx
-import imagehash
-import numpy as np
-import pytesseract
-from bs4 import BeautifulSoup
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from PIL import ExifTags, Image, ImageChops, ImageOps
+
+# Heavy / optional libraries: if one is missing the server still starts and the
+# UI still opens; /  shows which package is missing.
+MISSING = []
+try:
+    import httpx
+except ImportError:
+    httpx = None
+    MISSING.append("httpx")
+try:
+    import imagehash
+except ImportError:
+    imagehash = None
+    MISSING.append("imagehash")
+try:
+    import numpy as np
+except ImportError:
+    np = None
+    MISSING.append("numpy")
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None
+    MISSING.append("pytesseract")
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
+    MISSING.append("beautifulsoup4")
+
+
+def need_libs():
+    if MISSING:
+        raise HTTPException(503, f"Server is missing Python packages: {', '.join(MISSING)}. Run: pip install -r requirements.txt")
 
 # ----------------------------------------------------------------------------
 # Config
@@ -705,7 +734,7 @@ UI_HTML = """<!DOCTYPE html>
 # ----------------------------------------------------------------------------
 @app.get("/")
 def health():
-    return {"status": "ok", "docs": "/docs", "ui": "/ui"}
+    return {"status": "ok", "docs": "/docs", "ui": "/ui", "missing_packages": MISSING}
 
 
 @app.get("/ui", response_class=HTMLResponse)
@@ -720,6 +749,7 @@ async def verify_image(
     expected_receiver: Optional[str] = Form(None),
     register: bool = Form(True),
 ):
+    need_libs()
     raw = await file.read(MAX_IMAGE_BYTES + 1)  # never load more than the limit
     if len(raw) > MAX_IMAGE_BYTES:
         raise HTTPException(413, "Image too large (max 8 MB)")
@@ -739,6 +769,7 @@ async def verify_transaction(
     expected_receiver: Optional[str] = Form(None),
 ):
     """Check a transaction ID directly (no image). Most reliable method."""
+    need_libs()
     res = await confirm_with_provider(
         provider.strip().lower(), transaction_id.strip().upper(), expected_amount, expected_receiver
     )
@@ -750,3 +781,10 @@ async def verify_transaction(
     else:
         verdict = "UNVERIFIED"
     return {"verdict": verdict, "provider_check": res}
+
+
+if __name__ == "__main__":  # lets you start it with:  python main.py
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+   
