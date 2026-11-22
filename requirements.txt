@@ -2,8 +2,8 @@ fastapi
 uvicorn[standard]
 python-multipart
 httpx
-imagehash
+pillow
 numpy
+imagehash
 pytesseract
 beautifulsoup4
-pillow
