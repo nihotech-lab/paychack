@@ -92,7 +92,7 @@ def auth(x_api_key: str = Header(default="")):
 
 
 def db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
     conn.execute(
         """CREATE TABLE IF NOT EXISTS receipts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,7 +158,7 @@ def extract_amount(text: str) -> Optional[float]:
 
 def extract_receiver(text: str) -> Optional[str]:
     m = re.search(
-        r"(?:receiver|credited\s*party|paid\s*to|to)\s*(?:name)?\s*[:\-]\s*([A-Za-z .'-]{3,60})",
+        r"(?:receiver|credited\s*party|paid\s*to|\bto)\s*(?:name)?\s*[:\-]\s*([A-Za-z .'-]{3,60})",
         text,
         re.I,
     )
