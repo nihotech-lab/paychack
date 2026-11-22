@@ -2,10 +2,10 @@
 Payment Screenshot Checker (Telebirr, CBE, CBE Birr, Awash, Dashen, BOA, ...)
 
 What it does
-  1. Reads the screenshot with OCR (transaction ID, amount, receiver, provider).
-  2. Looks for signs of editing (EXIF software tags, ELA, missing fields).
-  3. Detects reused receipts (same image / same transaction ID) with SQLite.
-  4. Confirms the transaction with the provider's official receipt page (Telebirr
+1. Reads the screenshot with OCR (transaction ID, amount, receiver, provider).
+2. Looks for signs of editing (EXIF software tags, ELA, missing fields).
+3. Detects reused receipts (same image / same transaction ID) with SQLite.
+4. Confirms the transaction with the provider's official receipt page (Telebirr
      is built in; other banks can be added in PROVIDERS).
 
 IMPORTANT: An image alone can NEVER prove a payment is real. Only step 4
@@ -15,6 +15,7 @@ Run:
     pip install -r requirements.txt
     uvicorn main:app --reload --port 8000
 Docs:  http://localhost:8000/docs
+UI:    http://localhost:8000/ui
 """
 import hashlib
 import io
@@ -22,6 +23,7 @@ import os
 import re
 import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -30,16 +32,20 @@ import numpy as np
 import pytesseract
 from bs4 import BeautifulSoup
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse
 from PIL import ExifTags, Image, ImageChops
 
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
 API_KEY = os.getenv("API_KEY", "")  # leave empty to disable auth (dev only)
-DB_PATH = os.getenv("DB_PATH", "receipts.db")
+DB_PATH = os.getenv("DB_PATH", "/tmp/receipts.db")
 VERIFY_SSL = os.getenv("VERIFY_SSL", "true").lower() == "true"
 OCR_LANG = os.getenv("OCR_LANG", "eng")  # use "eng+amh" if amh traineddata installed
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
+BASE_DIR = Path(__file__).resolve().parent
+UI_FILE = BASE_DIR / "index.html"
 
 # Receipt lookup URLs. {txn} is replaced with the transaction ID.
 # Telebirr's public receipt page - confirm the URL still works for you.
@@ -68,6 +74,13 @@ EDITOR_TAGS = [
 ]
 
 app = FastAPI(title="Payment Screenshot Checker", version="1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # restrict to specific origins in production if needed
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ----------------------------------------------------------------------------
@@ -362,7 +375,14 @@ async def analyze(
 # ----------------------------------------------------------------------------
 @app.get("/")
 def health():
-    return {"status": "ok", "docs": "/docs"}
+    return {"status": "ok", "docs": "/docs", "ui": "/ui"}
+
+
+@app.get("/ui", response_class=HTMLResponse)
+def ui():
+    if UI_FILE.exists():
+        return FileResponse(UI_FILE)
+    return HTMLResponse("<h3>index.html not found next to main.py</h3>", status_code=404)
 
 
 @app.post("/verify-image", dependencies=[Depends(auth)])
