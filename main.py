@@ -34,7 +34,7 @@ from fastapi.responses import HTMLResponse
 from PIL import ExifTags, Image, ImageChops, ImageOps
 
 # Heavy / optional libraries: if one is missing the server still starts and the
-# UI still opens; /  shows which package is missing.
+# UI still opens; GET / shows which package is missing.
 MISSING = []
 try:
     import httpx
@@ -65,15 +65,21 @@ except ImportError:
 
 def need_libs():
     if MISSING:
-        raise HTTPException(503, f"Server is missing Python packages: {', '.join(MISSING)}. Run: pip install -r requirements.txt")
+        raise HTTPException(
+            503,
+            f"Server is missing Python packages: {', '.join(MISSING)}. Run: pip install -r requirements.txt",
+        )
+
 
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
 API_KEY = os.getenv("API_KEY", "")  # leave empty to disable auth (dev only)
-DB_PATH = os.getenv("DB_PATH", "/tmp/receipts.db")
+DB_PATH = os.getenv("DB_PATH", "/tmp/receipts.db")  # /tmp is wiped on restart on most hosts!
 VERIFY_SSL = os.getenv("VERIFY_SSL", "true").lower() == "true"
 OCR_LANG = os.getenv("OCR_LANG", "eng")  # use "eng+amh" if amh traineddata installed
+OCR_TIMEOUT = int(os.getenv("OCR_TIMEOUT", "40"))  # seconds per OCR pass
+ELA_THRESHOLD = float(os.getenv("ELA_THRESHOLD", "10"))
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 Image.MAX_IMAGE_PIXELS = 40_000_000  # protect against decompression bombs
 
@@ -100,9 +106,15 @@ EDITOR_TAGS = [
     "paint.net", "affinity", "photopea", "fotor", "inpaint", "meitu", "facetune",
 ]
 
+# Words a provider page may show when the ID does not exist (page can still return HTTP 200)
+NOT_FOUND_WORDS = [
+    "not found", "no record", "invalid transaction", "invalid receipt",
+    "does not exist", "no transaction", "no data found",
+]
+
 TXN_RE = re.compile(r"^[A-Z0-9]{6,30}$")
 
-app = FastAPI(title="Payment Screenshot Checker", version="1.1")
+app = FastAPI(title="Payment Screenshot Checker", version="1.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -125,6 +137,10 @@ def db():
     if folder:
         os.makedirs(folder, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.DatabaseError:
+        pass
     conn.execute(
         """CREATE TABLE IF NOT EXISTS receipts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -136,15 +152,95 @@ def db():
     return conn
 
 
+def check_duplicates(sha: str, ph_obj, txn: Optional[str], amount: Optional[float]):
+    """Blocking DB work (run in a thread). Returns (dup_img, dup_txn, near_dup)."""
+    conn = db()
+    try:
+        dup_img = conn.execute("SELECT 1 FROM receipts WHERE sha256=?", (sha,)).fetchone() is not None
+        dup_txn = False
+        if txn:
+            dup_txn = (
+                conn.execute(
+                    "SELECT 1 FROM receipts WHERE txn=? AND status IN ('REAL','UNVERIFIED')", (txn,)
+                ).fetchone()
+                is not None
+            )
+        near_dup = False
+        if not (dup_img or dup_txn):
+            rows = conn.execute(
+                "SELECT phash, txn, amount FROM receipts WHERE phash IS NOT NULL ORDER BY id DESC LIMIT 5000"
+            ).fetchall()
+            for old_hash, old_txn, old_amount in rows:
+                try:
+                    # Receipts of one provider all look alike, so a small hash distance
+                    # alone is normal. Only flag when the look AND the amount (or ID) match.
+                    if ph_obj - imagehash.hex_to_hash(old_hash) <= 2:
+                        same_amount = (
+                            amount is not None and old_amount is not None and abs(old_amount - amount) < 0.01
+                        )
+                        same_txn = txn is not None and old_txn == txn
+                        if same_amount or same_txn:
+                            near_dup = True
+                            break
+                except Exception:
+                    continue
+        return dup_img, dup_txn, near_dup
+    finally:
+        conn.close()
+
+
+def save_receipt(txn, sha, ph, provider, amount, verdict):
+    conn = db()
+    try:
+        conn.execute(
+            "INSERT INTO receipts (txn, sha256, phash, provider, amount, status, created_at) VALUES (?,?,?,?,?,?,?)",
+            (txn, sha, ph, provider, amount, verdict, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ----------------------------------------------------------------------------
 # OCR + field extraction
 # ----------------------------------------------------------------------------
 def run_ocr(img: Image.Image) -> str:
     try:
-        return pytesseract.image_to_string(img, lang=OCR_LANG)
+        return pytesseract.image_to_string(img, lang=OCR_LANG, timeout=OCR_TIMEOUT)
     except pytesseract.TesseractError:
         # language pack missing -> fall back to English
-        return pytesseract.image_to_string(img, lang="eng")
+        return pytesseract.image_to_string(img, lang="eng", timeout=OCR_TIMEOUT)
+
+
+def preprocess_for_ocr(img: Image.Image) -> Image.Image:
+    """Grayscale, upscale small images, boost contrast, un-invert dark-mode screenshots."""
+    g = ImageOps.grayscale(img)
+    if g.width < 1200:
+        g = g.resize((g.width * 2, g.height * 2), Image.LANCZOS)
+    g = ImageOps.autocontrast(g)
+    if np is not None and float(np.asarray(g).mean()) < 110:
+        g = ImageOps.invert(g)
+    return g
+
+
+def field_count(text: str) -> int:
+    return sum(
+        [
+            detect_provider(text) is not None,
+            extract_txn(text) is not None,
+            bool(extract_amounts(text)),
+        ]
+    )
+
+
+def ocr_best(img: Image.Image) -> str:
+    """OCR the image; if key fields are missing, retry with preprocessing and keep the better text."""
+    text = run_ocr(img)
+    if field_count(text) < 3:
+        text2 = run_ocr(preprocess_for_ocr(img))
+        if field_count(text2) > field_count(text):
+            return text2
+    return text
 
 
 def detect_provider(text: str) -> Optional[str]:
@@ -158,7 +254,8 @@ def detect_provider(text: str) -> Optional[str]:
 
 
 TXN_LABEL_RE = re.compile(
-    r"(?:transaction\s*(?:no|number|id)|receipt\s*no|ref(?:erence)?\s*(?:no|number)?)"
+    r"(?:transaction\s*(?:no|number|id)|receipt\s*(?:no|number)|invoice\s*(?:no|number)"
+    r"|ref(?:erence)?\s*(?:no|number|id)?)"
     r"\s*\.?\s*[:\-]?\s*([A-Z0-9]{8,20})\b",
     re.I,
 )
@@ -175,20 +272,32 @@ def extract_txn(text: str) -> Optional[str]:
     return None
 
 
+# Ordered by priority: the "total paid" amount is the most reliable one.
 AMOUNT_PATTERNS = [
-    r"(?:total\s*paid\s*amount|amount|total)\s*[:\-]?\s*(?:ETB|Birr)?\s*(\d[\d,]*(?:\.\d{1,2})?)",
+    r"total\s*paid\s*amount\s*[:\-]?\s*(?:ETB|Birr)?\s*(\d[\d,]*(?:\.\d{1,2})?)",
+    r"(?:transferred\s*amount|transaction\s*amount|amount\s*paid|amount)\s*[:\-]?\s*(?:ETB|Birr)?\s*(\d[\d,]*(?:\.\d{1,2})?)",
+    r"total\s*[:\-]?\s*(?:ETB|Birr)?\s*(\d[\d,]*(?:\.\d{1,2})?)",
     r"(\d[\d,]*(?:\.\d{1,2})?)\s*(?:ETB|Birr)",
 ]
 
 
-def extract_amount(text: str) -> Optional[float]:
+def extract_amounts(text: str) -> list:
+    """All candidate amounts, highest-priority first (no duplicates)."""
+    found = []
     for p in AMOUNT_PATTERNS:
         for m in re.finditer(p, text, re.I):
             try:
-                return float(m.group(1).replace(",", ""))
+                v = float(m.group(1).replace(",", ""))
             except ValueError:
                 continue
-    return None
+            if v not in found:
+                found.append(v)
+    return found
+
+
+def extract_amount(text: str) -> Optional[float]:
+    amounts = extract_amounts(text)
+    return amounts[0] if amounts else None
 
 
 def extract_receiver(text: str) -> Optional[str]:
@@ -205,10 +314,23 @@ def extract_date(text: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def parse_optional_float(value: Optional[str], name: str) -> Optional[float]:
+    """Form fields arrive as text; empty string (Swagger UI) means 'not given'."""
+    if value is None:
+        return None
+    value = value.strip().replace(",", "")
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        raise HTTPException(422, f"{name} must be a number")
+
+
 # ----------------------------------------------------------------------------
 # Image forensics (weak signals, never proof)
 # ----------------------------------------------------------------------------
-def exif_flags(img: Image.Image) -> list[str]:
+def exif_flags(img: Image.Image) -> list:
     flags = []
     try:
         exif = img.getexif()
@@ -220,7 +342,7 @@ def exif_flags(img: Image.Image) -> list[str]:
     except Exception:
         pass
     info_sw = str(img.info.get("Software", "")).lower()
-    if any(e in info_sw for e in EDITOR_TAGS):
+    if info_sw and any(e in info_sw for e in EDITOR_TAGS):
         flags.append(f"Edited with image editor: {info_sw}")
     return flags
 
@@ -244,6 +366,26 @@ def ela_ratio(rgb: Image.Image, quality: int = 90) -> float:
     return float(np.max(blocks) / (np.median(blocks) + 1e-6))
 
 
+def prepare_image(img: Image.Image) -> Image.Image:
+    """Fix phone rotation and convert any mode (RGBA, P, L...) to RGB (transparency -> white)."""
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        rgba = img.convert("RGBA")
+        bg = Image.new("RGB", rgba.size, (255, 255, 255))
+        bg.paste(rgba, mask=rgba.split()[-1])
+        return bg
+    return img.convert("RGB")
+
+
+def load_image(raw: bytes) -> Image.Image:
+    img = Image.open(io.BytesIO(raw))
+    img.load()
+    return img
+
+
 # ----------------------------------------------------------------------------
 # Provider confirmation
 # ----------------------------------------------------------------------------
@@ -254,9 +396,10 @@ async def confirm_with_provider(
     if not cfg or not cfg["receipt_url"]:
         return {"checked": False, "reason": f"No receipt lookup configured for '{provider}'"}
 
-    # never put raw user input into a URL path
+    # never put raw user input into a URL path.
+    # A bad format may just be an OCR misread, so it is "not checked", not "fake".
     if not TXN_RE.match(txn):
-        return {"checked": True, "found": False, "reason": "Transaction ID has an invalid format"}
+        return {"checked": False, "reason": "Transaction ID has an invalid format (maybe an OCR misread)"}
 
     url = cfg["receipt_url"].replace("{txn}", quote(txn, safe=""))
     try:
@@ -265,7 +408,7 @@ async def confirm_with_provider(
     except httpx.HTTPError as e:
         return {"checked": False, "reason": f"Could not reach provider: {e.__class__.__name__}"}
 
-    if r.status_code == 404:
+    if r.status_code in (404, 410):
         return {"checked": True, "found": False, "reason": "Provider has no such transaction"}
     if r.status_code != 200:
         return {"checked": False, "reason": f"Provider returned HTTP {r.status_code}"}
@@ -274,6 +417,8 @@ async def confirm_with_provider(
     low = text.lower()
     if txn.lower() not in low:
         return {"checked": True, "found": False, "reason": "Receipt page does not contain this transaction ID"}
+    if any(w in low for w in NOT_FOUND_WORDS):
+        return {"checked": True, "found": False, "reason": "Provider page says the transaction was not found"}
 
     result = {"checked": True, "found": True, "amount_match": None, "receiver_match": None}
     if amount is not None:
@@ -300,15 +445,6 @@ def decide(score: int, provider_result: dict, hard_fake: bool) -> str:
     return "UNVERIFIED" if score >= 60 else "SUSPICIOUS"
 
 
-def prepare_image(img: Image.Image) -> Image.Image:
-    """Fix phone rotation and convert any mode (RGBA, P, L...) to RGB."""
-    try:
-        img = ImageOps.exif_transpose(img)
-    except Exception:
-        pass
-    return img.convert("RGB")
-
-
 async def analyze(
     img: Image.Image,
     raw: bytes,
@@ -320,16 +456,20 @@ async def analyze(
 
     fmt = (img.format or "").upper()  # read before converting (format is lost after)
     flags = exif_flags(img)
-    rgb = prepare_image(img)
+    rgb = await run_in_threadpool(prepare_image, img)
 
     try:
-        text = await run_in_threadpool(run_ocr, rgb)
+        text = await run_in_threadpool(ocr_best, rgb)
     except pytesseract.TesseractNotFoundError:
         raise HTTPException(503, "Tesseract OCR is not installed on the server")
+    except RuntimeError:  # pytesseract raises RuntimeError on timeout
+        raise HTTPException(504, "OCR took too long, try a smaller or clearer image")
 
+    low_text = text.lower()
     provider = detect_provider(text)
     txn = extract_txn(text)
-    amount = extract_amount(text)
+    amounts = extract_amounts(text)
+    amount = amounts[0] if amounts else None
     receiver = extract_receiver(text)
     date = extract_date(text)
 
@@ -343,11 +483,16 @@ async def analyze(
         score -= 15
         reasons.append("No amount found in the image")
 
-    if expected_amount is not None and amount is not None and abs(amount - expected_amount) > 0.01:
-        hard_fake = True
-        reasons.append(f"Amount on image ({amount}) differs from expected ({expected_amount})")
-    if expected_receiver and receiver:
-        if not all(w in receiver.lower() for w in expected_receiver.lower().split() if len(w) > 2):
+    # Amount: compare with ALL amounts found (fees / subtotals may appear first)
+    if expected_amount is not None and amounts:
+        if not any(abs(a - expected_amount) <= 0.01 for a in amounts):
+            hard_fake = True
+            reasons.append(f"Amount on image ({amount}) differs from expected ({expected_amount})")
+
+    # Receiver: look in the whole OCR text, not only in the one guessed line
+    if expected_receiver:
+        words = [w for w in expected_receiver.lower().split() if len(w) > 2]
+        if words and not all(w in low_text for w in words):
             score -= 25
             reasons.append("Receiver name on image does not match expected receiver")
 
@@ -356,69 +501,40 @@ async def analyze(
         reasons.append(f)
     if fmt in ("JPEG", "JPG"):
         ratio = await run_in_threadpool(ela_ratio, rgb)
-        if ratio > 8:
+        if ratio > ELA_THRESHOLD:
             score -= 15
             reasons.append(f"Uneven compression (ELA ratio {ratio:.1f}) - possible edited region")
 
     sha = hashlib.sha256(raw).hexdigest()
-    ph_obj = imagehash.phash(rgb)
+    ph_obj = await run_in_threadpool(imagehash.phash, rgb)
     ph = str(ph_obj)
 
     provider_result = {"checked": False, "reason": "No transaction ID"}
-    conn = db()
-    try:
-        dup_img = conn.execute("SELECT 1 FROM receipts WHERE sha256=?", (sha,)).fetchone()
-        dup_txn = (
-            conn.execute(
-                "SELECT 1 FROM receipts WHERE txn=? AND status IN ('REAL','UNVERIFIED')", (txn,)
-            ).fetchone()
-            if txn
-            else None
-        )
 
-        near_dup = False
-        if not (dup_img or dup_txn):
-            rows = conn.execute(
-                "SELECT phash FROM receipts WHERE phash IS NOT NULL ORDER BY id DESC LIMIT 5000"
-            ).fetchall()
-            for (old,) in rows:
-                try:
-                    # distance 0 also counts: same picture re-saved/re-compressed
-                    if ph_obj - imagehash.hex_to_hash(old) <= 4:
-                        near_dup = True
-                        break
-                except Exception:
-                    continue
+    dup_img, dup_txn, near_dup = await run_in_threadpool(check_duplicates, sha, ph_obj, txn, amount)
+    if dup_img or dup_txn:
+        hard_fake = True
+        reasons.append("This receipt/transaction ID was already submitted before (reuse)")
+    elif near_dup:
+        score -= 25
+        reasons.append("Image looks like a previous receipt with the same amount/ID (possible edited or re-saved copy)")
 
-        if dup_img or dup_txn:
-            hard_fake = True
-            reasons.append("This receipt/transaction ID was already submitted before (reuse)")
-        elif near_dup:
-            score -= 25
-            reasons.append("Image is very similar to a previous receipt (possible edited or re-saved copy)")
+    if txn:
+        provider_result = await confirm_with_provider(provider, txn, amount, receiver)
+        if provider_result.get("checked") and provider_result.get("found") is False:
+            reasons.append(provider_result["reason"])
+        elif provider_result.get("found"):
+            if provider_result.get("amount_match") is False:
+                reasons.append("Amount on image does not match the provider's record")
+            if provider_result.get("receiver_match") is False:
+                reasons.append("Receiver on image does not match the provider's record")
+        else:
+            reasons.append(f"Not confirmed with provider: {provider_result.get('reason')}")
 
-        if txn:
-            provider_result = await confirm_with_provider(provider, txn, amount, receiver)
-            if provider_result.get("checked") and provider_result.get("found") is False:
-                reasons.append(provider_result["reason"])
-            elif provider_result.get("found"):
-                if provider_result.get("amount_match") is False:
-                    reasons.append("Amount on image does not match the provider's record")
-                if provider_result.get("receiver_match") is False:
-                    reasons.append("Receiver on image does not match the provider's record")
-            else:
-                reasons.append(f"Not confirmed with provider: {provider_result.get('reason')}")
+    verdict = decide(max(score, 0), provider_result, hard_fake)
 
-        verdict = decide(max(score, 0), provider_result, hard_fake)
-
-        if register:
-            conn.execute(
-                "INSERT INTO receipts (txn, sha256, phash, provider, amount, status, created_at) VALUES (?,?,?,?,?,?,?)",
-                (txn, sha, ph, provider, amount, verdict, datetime.now(timezone.utc).isoformat()),
-            )
-            conn.commit()
-    finally:
-        conn.close()
+    if register:
+        await run_in_threadpool(save_receipt, txn, sha, ph, provider, amount, verdict)
 
     return {
         "verdict": verdict,
@@ -531,6 +647,7 @@ UI_HTML = """<!DOCTYPE html>
       cursor: pointer;
     }
     .btn-primary:hover { background: var(--accent-hover); }
+    .btn-primary:disabled { opacity: 0.6; cursor: wait; }
     .action-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
     .status-text { font-size: 0.9rem; color: var(--muted); }
     .badge {
@@ -553,13 +670,15 @@ UI_HTML = """<!DOCTYPE html>
       color: #e2e8f0;
       font-size: 0.85rem;
       overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
     }
   </style>
 </head>
 <body>
   <main class="container">
     <h1>Payment Screenshot Checker</h1>
-    <p class="sub">Verify payment screenshots or transaction IDs on Render.</p>
+    <p class="sub">Verify payment screenshots or transaction IDs.</p>
 
     <section class="card">
       <div class="field">
@@ -597,7 +716,7 @@ UI_HTML = """<!DOCTYPE html>
           <input id="register" type="checkbox" checked />
           Save receipt to database to detect reuse
         </label>
-        <button class="btn-primary" type="submit">Analyze Screenshot</button>
+        <button id="imgBtn" class="btn-primary" type="submit">Analyze Screenshot</button>
       </form>
 
       <form id="txnForm" style="display:none;">
@@ -628,7 +747,7 @@ UI_HTML = """<!DOCTYPE html>
             <input id="txnReceiver" type="text" placeholder="e.g. Receiver Name" />
           </div>
         </div>
-        <button class="btn-primary" type="submit">Verify Transaction</button>
+        <button id="txnBtn" class="btn-primary" type="submit">Verify Transaction</button>
       </form>
     </section>
 
@@ -641,6 +760,7 @@ UI_HTML = """<!DOCTYPE html>
   <script>
     const outputEl = document.getElementById("output");
     const badgeEl = document.getElementById("verdictBadge");
+    const ALLOWED = ["REAL", "UNVERIFIED", "SUSPICIOUS", "FAKE"];
 
     function getHeaders() {
       const k = document.getElementById("apiKey").value.trim();
@@ -648,13 +768,24 @@ UI_HTML = """<!DOCTYPE html>
     }
 
     function showResult(data) {
+      badgeEl.textContent = "";
       if (data && data.verdict) {
         const v = String(data.verdict).toUpperCase();
-        badgeEl.innerHTML = `<span class="badge ${v}">${v}</span>`;
-      } else {
-        badgeEl.innerHTML = "";
+        if (ALLOWED.includes(v)) {
+          const span = document.createElement("span");
+          span.className = "badge " + v;
+          span.textContent = v;
+          badgeEl.appendChild(span);
+        }
       }
       outputEl.textContent = JSON.stringify(data, null, 2);
+    }
+
+    // Read JSON safely: a server crash returns plain text, not JSON
+    async function readResponse(r) {
+      const t = await r.text();
+      try { return JSON.parse(t); }
+      catch (_) { return { error: "HTTP " + r.status, detail: t.slice(0, 500) }; }
     }
 
     document.getElementById("tabImg").addEventListener("click", () => {
@@ -676,7 +807,7 @@ UI_HTML = """<!DOCTYPE html>
       st.textContent = "Checking...";
       try {
         const r = await fetch("/", { headers: getHeaders() });
-        const d = await r.json();
+        const d = await readResponse(r);
         st.textContent = r.ok ? `Online (${r.status})` : `Error (${r.status})`;
         showResult(d);
       } catch (err) {
@@ -689,6 +820,7 @@ UI_HTML = """<!DOCTYPE html>
       e.preventDefault();
       const f = document.getElementById("file").files[0];
       if (!f) return;
+      const btn = document.getElementById("imgBtn");
       const fd = new FormData();
       fd.append("file", f);
       const amt = document.getElementById("imgAmount").value;
@@ -696,18 +828,22 @@ UI_HTML = """<!DOCTYPE html>
       if (amt !== "") fd.append("expected_amount", amt);
       if (rcv !== "") fd.append("expected_receiver", rcv);
       fd.append("register", document.getElementById("register").checked);
-      badgeEl.innerHTML = "";
+      badgeEl.textContent = "";
       outputEl.textContent = "Analyzing screenshot...";
+      btn.disabled = true;
       try {
         const r = await fetch("/verify-image", { method: "POST", headers: getHeaders(), body: fd });
-        showResult(await r.json());
+        showResult(await readResponse(r));
       } catch (err) {
         showResult({ error: err.message });
+      } finally {
+        btn.disabled = false;
       }
     });
 
     document.getElementById("txnForm").addEventListener("submit", async (e) => {
       e.preventDefault();
+      const btn = document.getElementById("txnBtn");
       const fd = new FormData();
       fd.append("transaction_id", document.getElementById("txnId").value.trim());
       fd.append("provider", document.getElementById("provider").value);
@@ -715,13 +851,16 @@ UI_HTML = """<!DOCTYPE html>
       const rcv = document.getElementById("txnReceiver").value.trim();
       if (amt !== "") fd.append("expected_amount", amt);
       if (rcv !== "") fd.append("expected_receiver", rcv);
-      badgeEl.innerHTML = "";
+      badgeEl.textContent = "";
       outputEl.textContent = "Verifying transaction...";
+      btn.disabled = true;
       try {
         const r = await fetch("/verify-transaction", { method: "POST", headers: getHeaders(), body: fd });
-        showResult(await r.json());
+        showResult(await readResponse(r));
       } catch (err) {
         showResult({ error: err.message });
+      } finally {
+        btn.disabled = false;
       }
     });
   </script>
@@ -745,33 +884,36 @@ def ui():
 @app.post("/verify-image", dependencies=[Depends(auth)])
 async def verify_image(
     file: UploadFile = File(...),
-    expected_amount: Optional[float] = Form(None),
+    expected_amount: Optional[str] = Form(None),
     expected_receiver: Optional[str] = Form(None),
     register: bool = Form(True),
 ):
     need_libs()
+    amount = parse_optional_float(expected_amount, "expected_amount")
+    receiver = (expected_receiver or "").strip() or None
     raw = await file.read(MAX_IMAGE_BYTES + 1)  # never load more than the limit
     if len(raw) > MAX_IMAGE_BYTES:
         raise HTTPException(413, "Image too large (max 8 MB)")
     try:
-        img = Image.open(io.BytesIO(raw))
-        img.load()
+        img = await run_in_threadpool(load_image, raw)
     except Exception:
         raise HTTPException(400, "File is not a valid image")
-    return await analyze(img, raw, expected_amount, expected_receiver, register)
+    return await analyze(img, raw, amount, receiver, register)
 
 
 @app.post("/verify-transaction", dependencies=[Depends(auth)])
 async def verify_transaction(
     transaction_id: str = Form(...),
     provider: str = Form("telebirr"),
-    expected_amount: Optional[float] = Form(None),
+    expected_amount: Optional[str] = Form(None),
     expected_receiver: Optional[str] = Form(None),
 ):
     """Check a transaction ID directly (no image). Most reliable method."""
     need_libs()
+    amount = parse_optional_float(expected_amount, "expected_amount")
+    receiver = (expected_receiver or "").strip() or None
     res = await confirm_with_provider(
-        provider.strip().lower(), transaction_id.strip().upper(), expected_amount, expected_receiver
+        provider.strip().lower(), transaction_id.strip().upper(), amount, receiver
     )
     if res.get("checked") and res.get("found"):
         ok = res.get("amount_match") is not False and res.get("receiver_match") is not False
@@ -787,4 +929,3 @@ if __name__ == "__main__":  # lets you start it with:  python main.py
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
-   
