@@ -6,14 +6,14 @@ What it does
 2. Looks for signs of editing (EXIF software tags, ELA, missing fields).
 3. Detects reused receipts (same image / same transaction ID) with SQLite.
 4. Confirms the transaction with the provider's official receipt page (Telebirr
-     is built in; other banks can be added in PROVIDERS).
+   is built in; other banks can be added in PROVIDERS).
 
 IMPORTANT: An image alone can NEVER prove a payment is real. Only step 4
 (asking the provider) is proof. Steps 1-3 only catch lazy fakes and reuse.
 
 Run:
     pip install -r requirements.txt
-    uvicorn main:app --reload --port 8000
+    uvicorn main:app --host 0.0.0.0 --port 8000
 Docs:  http://localhost:8000/docs
 UI:    http://localhost:8000/ui
 """
@@ -23,7 +23,6 @@ import os
 import re
 import sqlite3
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -33,7 +32,7 @@ import pytesseract
 from bs4 import BeautifulSoup
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import HTMLResponse
 from PIL import ExifTags, Image, ImageChops
 
 # ----------------------------------------------------------------------------
@@ -44,12 +43,7 @@ DB_PATH = os.getenv("DB_PATH", "/tmp/receipts.db")
 VERIFY_SSL = os.getenv("VERIFY_SSL", "true").lower() == "true"
 OCR_LANG = os.getenv("OCR_LANG", "eng")  # use "eng+amh" if amh traineddata installed
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
-BASE_DIR = Path(__file__).resolve().parent
-UI_FILE = BASE_DIR / "index.html"
 
-# Receipt lookup URLs. {txn} is replaced with the transaction ID.
-# Telebirr's public receipt page - confirm the URL still works for you.
-# Banks that need an account suffix or an API key must be added by you.
 PROVIDERS = {
     "telebirr": {
         "keywords": ["telebirr", "ethio telecom", "ethiotelecom", "ethio-telecom"],
@@ -77,7 +71,7 @@ app = FastAPI(title="Payment Screenshot Checker", version="1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restrict to specific origins in production if needed
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -116,7 +110,6 @@ def run_ocr(img: Image.Image) -> str:
 
 def detect_provider(text: str) -> Optional[str]:
     low = text.lower()
-    # check longer / more specific keywords first
     for name, cfg in PROVIDERS.items():
         for kw in sorted(cfg["keywords"], key=len, reverse=True):
             if kw in low:
@@ -125,7 +118,6 @@ def detect_provider(text: str) -> Optional[str]:
 
 
 def extract_txn(text: str) -> Optional[str]:
-    # 1) token right after a "transaction" label
     m = re.search(
         r"(?:transaction\s*(?:no|number|id)\.?|receipt\s*no\.?|ref(?:erence)?\s*(?:no|number)?\.?)"
         r"\s*[:\-]?\s*([A-Z0-9]{8,20})",
@@ -134,7 +126,6 @@ def extract_txn(text: str) -> Optional[str]:
     )
     if m:
         return m.group(1).upper()
-    # 2) fallback: any 10-char token with letters AND digits (Telebirr style)
     for tok in re.findall(r"\b[A-Z0-9]{10}\b", text.upper()):
         if re.search(r"\d", tok) and re.search(r"[A-Z]", tok):
             return tok
@@ -191,8 +182,6 @@ def exif_flags(img: Image.Image) -> list[str]:
 
 
 def ela_ratio(img: Image.Image, quality: int = 90) -> float:
-    """Error Level Analysis: pasted/edited regions often compress differently.
-    Returns max-block / median-block error ratio. Unreliable for PNG screenshots."""
     rgb = img.convert("RGB")
     buf = io.BytesIO()
     rgb.save(buf, "JPEG", quality=quality)
@@ -212,7 +201,7 @@ def ela_ratio(img: Image.Image, quality: int = 90) -> float:
 
 
 # ----------------------------------------------------------------------------
-# Provider confirmation (the only real proof)
+# Provider confirmation
 # ----------------------------------------------------------------------------
 async def confirm_with_provider(
     provider: Optional[str], txn: str, amount: Optional[float], receiver: Optional[str]
@@ -260,7 +249,6 @@ def decide(score: int, provider_result: dict, hard_fake: bool) -> str:
         return "REAL" if score >= 60 else "SUSPICIOUS"
     if provider_result.get("checked") and provider_result.get("found") is False:
         return "FAKE"
-    # could not confirm with provider
     return "UNVERIFIED" if score >= 60 else "SUSPICIOUS"
 
 
@@ -290,7 +278,6 @@ async def analyze(
         score -= 15
         reasons.append("No amount found in the image")
 
-    # expectations from your order
     if expected_amount is not None and amount is not None and abs(amount - expected_amount) > 0.01:
         hard_fake = True
         reasons.append(f"Amount on image ({amount}) differs from expected ({expected_amount})")
@@ -299,7 +286,6 @@ async def analyze(
             score -= 25
             reasons.append("Receiver name on image does not match expected receiver")
 
-    # forensics
     for f in exif_flags(img):
         score -= 35
         reasons.append(f)
@@ -310,7 +296,6 @@ async def analyze(
             score -= 15
             reasons.append(f"Uneven compression (ELA ratio {ratio:.1f}) - possible edited region")
 
-    # duplicates
     sha = hashlib.sha256(raw).hexdigest()
     ph = str(imagehash.phash(img))
     conn = db()
@@ -331,7 +316,6 @@ async def analyze(
         score -= 25
         reasons.append("Image is very similar to a previous receipt but not identical (possible edited copy)")
 
-    # provider confirmation
     provider_result = {"checked": False, "reason": "No transaction ID"}
     if txn:
         provider_result = await confirm_with_provider(provider, txn, amount, receiver)
@@ -355,7 +339,7 @@ async def analyze(
     conn.close()
 
     return {
-        "verdict": verdict,  # REAL | FAKE | SUSPICIOUS | UNVERIFIED
+        "verdict": verdict,
         "score": max(score, 0),
         "reasons": reasons,
         "extracted": {
@@ -371,6 +355,299 @@ async def analyze(
 
 
 # ----------------------------------------------------------------------------
+# HTML + CSS UI
+# ----------------------------------------------------------------------------
+UI_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Payment Screenshot Checker</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --border: #334155;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --accent-hover: #0ea5e9;
+      --ok: #22c55e;
+      --warn: #f59e0b;
+      --bad: #ef4444;
+    }
+    * { box-sizing: border-box; font-family: system-ui, -apple-system, sans-serif; }
+    body {
+      margin: 0;
+      padding: 24px;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    .container { max-width: 820px; margin: 0 auto; }
+    h1 { margin: 0 0 6px; font-size: 1.55rem; }
+    .sub { margin: 0 0 20px; color: var(--muted); font-size: 0.92rem; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 18px;
+    }
+    .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+    @media (max-width: 640px) { .grid-2 { grid-template-columns: 1fr; } }
+    .field { margin-bottom: 14px; }
+    label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 6px; }
+    input, select {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      font-size: 0.95rem;
+    }
+    input:focus, select:focus {
+      outline: 2px solid var(--accent);
+      border-color: var(--accent);
+    }
+    .checkbox-label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text);
+      font-size: 0.9rem;
+      margin-bottom: 16px;
+      cursor: pointer;
+    }
+    .checkbox-label input[type="checkbox"] { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
+    .tabs { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+    .btn {
+      padding: 9px 14px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text);
+      font-size: 0.9rem;
+      cursor: pointer;
+    }
+    .btn:hover { border-color: var(--accent); }
+    .btn.active {
+      background: var(--accent);
+      color: #0f172a;
+      border-color: var(--accent);
+      font-weight: 600;
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: #0f172a;
+      border: none;
+      padding: 11px 18px;
+      border-radius: 8px;
+      font-size: 0.95rem;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .btn-primary:hover { background: var(--accent-hover); }
+    .action-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .status-text { font-size: 0.9rem; color: var(--muted); }
+    .badge {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 0.8rem;
+      font-weight: 700;
+      margin-bottom: 10px;
+    }
+    .REAL { background: rgba(34, 197, 94, 0.2); color: var(--ok); }
+    .UNVERIFIED, .SUSPICIOUS { background: rgba(245, 158, 11, 0.2); color: var(--warn); }
+    .FAKE { background: rgba(239, 68, 68, 0.2); color: var(--bad); }
+    pre {
+      margin: 0;
+      padding: 14px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: #020617;
+      color: #e2e8f0;
+      font-size: 0.85rem;
+      overflow-x: auto;
+    }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <h1>Payment Screenshot Checker</h1>
+    <p class="sub">Verify payment screenshots or transaction IDs on Render.</p>
+
+    <section class="card">
+      <div class="field">
+        <label for="apiKey">API Key (x-api-key, optional if API_KEY is not set)</label>
+        <input id="apiKey" type="password" placeholder="Enter API_KEY if configured" />
+      </div>
+      <div class="action-row">
+        <button id="healthBtn" class="btn" type="button">Check Health (/)</button>
+        <span id="healthStatus" class="status-text">Ready</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="tabs">
+        <button id="tabImg" class="btn active" type="button">Verify Screenshot</button>
+        <button id="tabTxn" class="btn" type="button">Verify Transaction ID</button>
+      </div>
+
+      <form id="imgForm">
+        <div class="field">
+          <label for="file">Receipt Screenshot (PNG, JPG, max 8 MB)</label>
+          <input id="file" type="file" accept="image/*" required />
+        </div>
+        <div class="grid-2">
+          <div class="field">
+            <label for="imgAmount">Expected Amount (optional)</label>
+            <input id="imgAmount" type="number" step="0.01" placeholder="e.g. 500.00" />
+          </div>
+          <div class="field">
+            <label for="imgReceiver">Expected Receiver (optional)</label>
+            <input id="imgReceiver" type="text" placeholder="e.g. Receiver Name" />
+          </div>
+        </div>
+        <label class="checkbox-label">
+          <input id="register" type="checkbox" checked />
+          Save receipt to database to detect reuse
+        </label>
+        <button class="btn-primary" type="submit">Analyze Screenshot</button>
+      </form>
+
+      <form id="txnForm" style="display:none;">
+        <div class="grid-2">
+          <div class="field">
+            <label for="txnId">Transaction ID</label>
+            <input id="txnId" type="text" required placeholder="e.g. TX1234567890" />
+          </div>
+          <div class="field">
+            <label for="provider">Provider</label>
+            <select id="provider">
+              <option value="telebirr">telebirr</option>
+              <option value="cbe">cbe</option>
+              <option value="awash">awash</option>
+              <option value="dashen">dashen</option>
+              <option value="boa">boa</option>
+              <option value="mpesa">mpesa</option>
+            </select>
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="field">
+            <label for="txnAmount">Expected Amount (optional)</label>
+            <input id="txnAmount" type="number" step="0.01" placeholder="e.g. 500.00" />
+          </div>
+          <div class="field">
+            <label for="txnReceiver">Expected Receiver (optional)</label>
+            <input id="txnReceiver" type="text" placeholder="e.g. Receiver Name" />
+          </div>
+        </div>
+        <button class="btn-primary" type="submit">Verify Transaction</button>
+      </form>
+    </section>
+
+    <section class="card">
+      <div id="verdictBadge"></div>
+      <pre id="output">Results will appear here...</pre>
+    </section>
+  </main>
+
+  <script>
+    const outputEl = document.getElementById("output");
+    const badgeEl = document.getElementById("verdictBadge");
+
+    function getHeaders() {
+      const k = document.getElementById("apiKey").value.trim();
+      return k ? { "x-api-key": k } : {};
+    }
+
+    function showResult(data) {
+      if (data && data.verdict) {
+        const v = String(data.verdict).toUpperCase();
+        badgeEl.innerHTML = `<span class="badge ${v}">${v}</span>`;
+      } else {
+        badgeEl.innerHTML = "";
+      }
+      outputEl.textContent = JSON.stringify(data, null, 2);
+    }
+
+    document.getElementById("tabImg").addEventListener("click", () => {
+      document.getElementById("imgForm").style.display = "block";
+      document.getElementById("txnForm").style.display = "none";
+      document.getElementById("tabImg").classList.add("active");
+      document.getElementById("tabTxn").classList.remove("active");
+    });
+
+    document.getElementById("tabTxn").addEventListener("click", () => {
+      document.getElementById("imgForm").style.display = "none";
+      document.getElementById("txnForm").style.display = "block";
+      document.getElementById("tabTxn").classList.add("active");
+      document.getElementById("tabImg").classList.remove("active");
+    });
+
+    document.getElementById("healthBtn").addEventListener("click", async () => {
+      const st = document.getElementById("healthStatus");
+      st.textContent = "Checking...";
+      try {
+        const r = await fetch("/", { headers: getHeaders() });
+        const d = await r.json();
+        st.textContent = r.ok ? `Online (${r.status})` : `Error (${r.status})`;
+        showResult(d);
+      } catch (err) {
+        st.textContent = "Offline / Error";
+        showResult({ error: err.message });
+      }
+    });
+
+    document.getElementById("imgForm").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const f = document.getElementById("file").files[0];
+      if (!f) return;
+      const fd = new FormData();
+      fd.append("file", f);
+      const amt = document.getElementById("imgAmount").value;
+      const rcv = document.getElementById("imgReceiver").value.trim();
+      if (amt !== "") fd.append("expected_amount", amt);
+      if (rcv !== "") fd.append("expected_receiver", rcv);
+      fd.append("register", document.getElementById("register").checked);
+      badgeEl.innerHTML = "";
+      outputEl.textContent = "Analyzing screenshot...";
+      try {
+        const r = await fetch("/verify-image", { method: "POST", headers: getHeaders(), body: fd });
+        showResult(await r.json());
+      } catch (err) {
+        showResult({ error: err.message });
+      }
+    });
+
+    document.getElementById("txnForm").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const fd = new FormData();
+      fd.append("transaction_id", document.getElementById("txnId").value.trim());
+      fd.append("provider", document.getElementById("provider").value);
+      const amt = document.getElementById("txnAmount").value;
+      const rcv = document.getElementById("txnReceiver").value.trim();
+      if (amt !== "") fd.append("expected_amount", amt);
+      if (rcv !== "") fd.append("expected_receiver", rcv);
+      badgeEl.innerHTML = "";
+      outputEl.textContent = "Verifying transaction...";
+      try {
+        const r = await fetch("/verify-transaction", { method: "POST", headers: getHeaders(), body: fd });
+        showResult(await r.json());
+      } catch (err) {
+        showResult({ error: err.message });
+      }
+    });
+  </script>
+</body>
+</html>"""
+
+
+# ----------------------------------------------------------------------------
 # Routes
 # ----------------------------------------------------------------------------
 @app.get("/")
@@ -380,9 +657,7 @@ def health():
 
 @app.get("/ui", response_class=HTMLResponse)
 def ui():
-    if UI_FILE.exists():
-        return FileResponse(UI_FILE)
-    return HTMLResponse("<h3>index.html not found next to main.py</h3>", status_code=404)
+    return HTMLResponse(content=UI_HTML)
 
 
 @app.post("/verify-image", dependencies=[Depends(auth)])
